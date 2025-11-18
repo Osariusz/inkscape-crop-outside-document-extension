@@ -16,13 +16,21 @@ import copy
 class MassCropToPage(inkex.EffectExtension):
 
     def effect(self):
-        # Get document dimensions
         svg = self.document.getroot()
-        width = self.svg.unittouu(svg.get('width', '100px'))
-        height = self.svg.unittouu(svg.get('height', '100px'))
+        # Get the page bounding box
+        page_bbox: BoundingBox = self.svg.get_page_bbox()
+        page_left = page_bbox.left
+        page_top = page_bbox.top
+        page_width = page_bbox.width
+        width = page_width
+        page_height = page_bbox.height
+        height = page_height
 
-        # Create page-sized rectangle path (document coords)
-        rect_path = f"M0,0 L{width},0 L{width},{height} L0,{height} Z"
+        # Now create your path for rectangle over that bbox
+        rect_path = f"M{page_left},{page_top} " \
+                    f"L{page_left + page_width},{page_top} " \
+                    f"L{page_left + page_width},{page_top + page_height} " \
+                    f"L{page_left},{page_top + page_height} Z"
         rect_csp = CubicSuperPath(Path(rect_path).to_absolute())
 
         # Find all path elements
