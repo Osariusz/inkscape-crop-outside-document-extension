@@ -12,6 +12,72 @@ from inkex import PathElement, Rectangle
 from inkex.paths import Path, CubicSuperPath
 from inkex.transforms import Transform
 import copy
+from math import isclose
+
+# --- helper functions (put inside your class or module) ---
+def _transform_to_matrix(transform_obj):
+    """
+    Convert an inkex.Transform object (or None) into a 3x3 numeric matrix:
+      [[a, c, e],
+       [b, d, f],
+       [0, 0, 1]]
+    inkex.Transform instances expose a .matrix or repr like Transform(((a,c,e),(b,d,f)))
+    """
+    if transform_obj is None:
+        return [[1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0]]
+    # transform_obj.matrix or transform_obj.__repr__ gives ((a,c,e),(b,d,f))
+    try:
+        mm = transform_obj.matrix  # usually ((a,c,e),(b,d,f))
+    except Exception:
+        # fallback: try to get transform string and build Transform
+        mm = Transform(str(transform_obj)).matrix
+
+    a, c, e = mm[0]
+    b, d, f = mm[1]
+    return [[float(a), float(c), float(e)],
+            [float(b), float(d), float(f)],
+            [0.0, 0.0, 1.0]]
+
+def _mat_mult(A, B):
+    """Multiply 3x3 matrices A*B"""
+    return [
+        [A[0][0]*B[0][0] + A[0][1]*B[1][0] + A[0][2]*B[2][0],
+         A[0][0]*B[0][1] + A[0][1]*B[1][1] + A[0][2]*B[2][1],
+         A[0][0]*B[0][2] + A[0][1]*B[1][2] + A[0][2]*B[2][2]],
+        [A[1][0]*B[0][0] + A[1][1]*B[1][0] + A[1][2]*B[2][0],
+         A[1][0]*B[0][1] + A[1][1]*B[1][1] + A[1][2]*B[2][1],
+         A[1][0]*B[0][2] + A[1][1]*B[1][2] + A[1][2]*B[2][2]],
+        [0.0, 0.0, 1.0]
+    ]
+
+def _mat_inverse(M):
+    """Inverse of a 3x3 affine matrix where last row is [0,0,1].
+       Returns None if not invertible.
+    """
+    a, c, e = M[0]
+    b, d, f = M[1]
+    det = a * d - b * c
+    if isclose(det, 0.0, abs_tol=1e-12):
+        return None
+    inv_det = 1.0 / det
+    # inverse of [[a,c,e],[b,d,f],[0,0,1]] is:
+    ai =  d * inv_det
+    bi = -b * inv_det
+    ci = -c * inv_det
+    di =  a * inv_det
+    ei = (c * f - d * e) * inv_det
+    fi = (b * e - a * f) * inv_det
+    return [[ai, ci, ei],
+            [bi, di, fi],
+            [0.0, 0.0, 1.0]]
+
+def _apply_mat_to_point(M, x, y):
+    """Apply 3x3 matrix M to point (x,y)."""
+    nx = M[0][0]*x + M[0][1]*y + M[0][2]
+    ny = M[1][0]*x + M[1][1]*y + M[1][2]
+    return nx, ny
 
 class MassCropToPage(inkex.EffectExtension):
 
@@ -100,39 +166,105 @@ class MassCropToPage(inkex.EffectExtension):
 
         return tx, ty
 
-    def apply_clip_to_path(self, path, width, height):
-        """Apply clip path to element as an alternative to boolean operations"""
+    # --- replace your apply_clip_to_path with the version below ---
+    def apply_clip_to_path(self, path, width, height, page_left=0.0, page_top=0.0):
+        """
+        Create a clipPath that clips `path` to the rectangle
+        (page_left,page_top)-(page_left+width,page_top+height),
+        correctly accounting for arbitrary ancestor+own transforms.
+        """
+        # 1) compute cumulative transform from root -> element (include element)
+        #    We'll multiply ancestor matrices in document order (root first).
+        ancestors = []
+        el = path
+        while el is not None:
+            ancestors.append(el)
+            el = el.getparent()
+        # ancestors is [element, parent, ..., root]; we want root..element order
+        ancestors = list(reversed(ancestors))
 
-        # Compute cumulative translation of ancestor groups for this element
-        tx, ty = self.get_ancestor_translation(path)
+        cum = [[1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]]
+        for anc in ancestors:
+            # anc.transform returns a Transform object or default Transform()
+            tr = None
+            try:
+                tr = anc.transform if hasattr(anc, 'transform') else None
+            except Exception:
+                # if anything goes wrong, skip this ancestor transform
+                tr = None
+            m = _transform_to_matrix(tr)
+            cum = _mat_mult(cum, m)
 
-        # Create clip path
+        # cum maps *element-local coords* -> *document coords*
+        # we need the inverse to map document page coords to element-local coords
+        inv = _mat_inverse(cum)
+        if inv is None:
+            # transform not invertible; fallback to translation-only approach (best effort)
+            inkex.errormsg(f"Warning: non-invertible transform for element {path.get('id')}; using translation-only fallback.")
+            # attempt the old tx,ty fallback (existing code path) so something still happens:
+            tx = 0.0; ty = 0.0
+            parent = path.getparent()
+            while parent is not None:
+                tr = parent.get('transform')
+                if tr:
+                    try:
+                        T = Transform(tr)
+                        tx += float(T.e)
+                        ty += float(T.f)
+                    except Exception:
+                        pass
+                parent = parent.getparent()
+            rect = Rectangle()
+            rect.set('x', str(-tx + page_left))
+            rect.set('y', str(-ty + page_top))
+            rect.set('width', str(width))
+            rect.set('height', str(height))
+            clip_id = self.svg.get_unique_id('clip_')
+            clip_path = inkex.ClipPath()
+            clip_path.set('id', clip_id)
+            clip_path.set('clipPathUnits', 'userSpaceOnUse')
+            clip_path.append(rect)
+            if self.svg.defs is None:
+                self.svg.append(inkex.Defs())
+            self.svg.defs.append(clip_path)
+            path.set('clip-path', f'url(#{clip_id})')
+            return
+
+        # 2) rectangle corners in document coords
+        x0 = float(page_left)
+        y0 = float(page_top)
+        x1 = float(page_left + width)
+        y1 = float(page_top)
+        x2 = float(page_left + width)
+        y2 = float(page_top + height)
+        x3 = float(page_left)
+        y3 = float(page_top + height)
+
+        # 3) map to element-local coords using inverse
+        p0 = _apply_mat_to_point(inv, x0, y0)
+        p1 = _apply_mat_to_point(inv, x1, y1)
+        p2 = _apply_mat_to_point(inv, x2, y2)
+        p3 = _apply_mat_to_point(inv, x3, y3)
+
+        # 4) make a path for the transformed rectangle (a polygon path)
+        d = f"M{p0[0]},{p0[1]} L{p1[0]},{p1[1]} L{p2[0]},{p2[1]} L{p3[0]},{p3[1]} Z"
+
+        # 5) create clipPath containing a path element
         clip_id = self.svg.get_unique_id('clip_')
         clip_path = inkex.ClipPath()
         clip_path.set('id', clip_id)
-
-        # Make explicit that the clip coordinates are in userSpaceOnUse
-        # so we know how to position the rectangle relative to the element's
-        # own user coordinate system.
         clip_path.set('clipPathUnits', 'userSpaceOnUse')
 
-        # Create rectangle for clip path.
-        # We offset the rectangle by -tx, -ty so that when the clipPath is
-        # interpreted in the *element's* user coordinate system it lines up with
-        # the document page (0,0)-(width,height).
-        rect = Rectangle()
-        rect.set('x', str(-tx))
-        rect.set('y', str(-ty))
-        rect.set('width', str(width))
-        rect.set('height', str(height))
+        clip_shape = inkex.PathElement()
+        clip_shape.set('d', d)
+        clip_path.append(clip_shape)
 
-        clip_path.append(rect)
-        # Ensure defs exists and append the clipPath there
         if self.svg.defs is None:
             self.svg.append(inkex.Defs())
         self.svg.defs.append(clip_path)
 
-        # Apply clip path to the element (use url(#id) reference)
         path.set('clip-path', f'url(#{clip_id})')
 
 if __name__ == '__main__':
